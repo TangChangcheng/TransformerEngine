@@ -43,6 +43,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, Quantizer
 from transformer_engine.pytorch.dynamo import TensorSpec, to_tensor_spec
+from transformer_engine.pytorch.dynamo.mxfp8_linear_210 import is_mxfp8_linear_210_available
 from transformer_engine.pytorch import (
     is_fp8_available,
     is_mxfp8_available,
@@ -1882,6 +1883,93 @@ def test_to_tensor_spec_quantized(factory, shape):
 # ---------------------------------------------------------------------------
 # te.Linear
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not is_mxfp8_linear_210_available(),
+    reason="PyTorch 2.10 MXFP8 Linear compatibility backend is not active",
+)
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("input_requires_grad,weight_requires_grad", [(True, False), (False, True), (True, True)])
+def test_te_linear_mxfp8_torch210_fullgraph(
+    dtype, bias, input_requires_grad, weight_requires_grad
+):
+    """Narrow 2.10 path: prewarmed 1D MXFP8 Linear fprop/bprop fullgraph.
+
+    This suite must stay independent of ``_opaque_available``: it exercises the
+    Tensor/primitive-only backend added for PyTorch 2.10 specifically.
+    """
+
+    device = "cuda"
+    fp8_recipe = recipe.MXFP8BlockScaling(enable_2d_quantization=False)
+    model = te.Linear(64, 32, bias=bias, params_dtype=dtype, device=device)
+    model.weight.requires_grad_(weight_requires_grad)
+    if bias:
+        model.bias.requires_grad_(weight_requires_grad)
+
+    def fn(inp):
+        with te.autocast(recipe=fp8_recipe):
+            return model(inp)
+
+    # The v1 contract requires metadata initialization before capture.  Keep the
+    # prewarm eager by running it before torch.compile is constructed.
+    warm = torch.randn(32, 64, dtype=dtype, device=device, requires_grad=input_requires_grad)
+    warm_out = fn(warm)
+    if input_requires_grad or weight_requires_grad:
+        warm_out.sum().backward()
+    model.zero_grad(set_to_none=True)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(fn, fullgraph=True)
+    base = torch.randn(32, 64, dtype=dtype, device=device)
+
+    inp_eager = base.detach().clone().requires_grad_(input_requires_grad)
+    model.zero_grad(set_to_none=True)
+    out_eager = fn(inp_eager)
+    if input_requires_grad or weight_requires_grad:
+        out_eager.sum().backward()
+    ref_out = out_eager.detach().clone()
+    ref_igrad = None if inp_eager.grad is None else inp_eager.grad.detach().clone()
+    ref_wgrad = None if model.weight.grad is None else model.weight.grad.detach().clone()
+    ref_bgrad = None if not bias or model.bias.grad is None else model.bias.grad.detach().clone()
+
+    inp_compiled = base.detach().clone().requires_grad_(input_requires_grad)
+    model.zero_grad(set_to_none=True)
+    out_compiled = compiled(inp_compiled).clone()
+    if input_requires_grad or weight_requires_grad:
+        out_compiled.sum().backward()
+
+    torch.testing.assert_close(out_compiled, ref_out, atol=_EAGER_ATOL, rtol=_EAGER_RTOL)
+    if ref_igrad is not None:
+        torch.testing.assert_close(inp_compiled.grad, ref_igrad, atol=_EAGER_ATOL, rtol=_EAGER_RTOL)
+    assert (model.weight.grad is None) == (ref_wgrad is None)
+    if ref_wgrad is not None:
+        torch.testing.assert_close(model.weight.grad, ref_wgrad, atol=_EAGER_ATOL, rtol=_EAGER_RTOL)
+    if bias:
+        assert (model.bias.grad is None) == (ref_bgrad is None)
+        if ref_bgrad is not None:
+            torch.testing.assert_close(model.bias.grad, ref_bgrad, atol=_EAGER_ATOL, rtol=_EAGER_RTOL)
+
+
+@pytest.mark.skipif(
+    not is_mxfp8_linear_210_available(),
+    reason="PyTorch 2.10 MXFP8 Linear compatibility backend is not active",
+)
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+def test_te_linear_mxfp8_torch210_rejects_non_mxfp8_recipe():
+    """The 2.10 backend must not silently route another recipe through MXFP8."""
+
+    model = te.Linear(64, 32, params_dtype=torch.bfloat16, device="cuda")
+    inp = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
+
+    def fn(x):
+        with te.autocast(recipe=recipe.Float8CurrentScaling()):
+            return model(x)
+
+    with pytest.raises(Exception, match="supports only MXFP8BlockScaling"):
+        torch.compile(fn, fullgraph=True)(inp)
 
 
 @pytest.mark.skipif(not _opaque_available, reason="torch opaque object API not available")

@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, Callable, Dict, Optional, Tuple, Union, List
 from functools import reduce
 from operator import mul as multiply_op
+import math
 import warnings
 import weakref
 
@@ -15,7 +16,7 @@ import torch
 
 import transformer_engine_torch as tex
 
-from transformer_engine.common.recipe import Recipe
+from transformer_engine.common.recipe import MXFP8BlockScaling, Recipe
 from transformer_engine.pytorch.torch_version import torch_version
 
 from .base import (
@@ -38,7 +39,7 @@ from ._common import (
     set_quantizer_usage_for_wgrad_all_gather,
     WeightGradStore,
 )
-from ..quantization import FP8GlobalStateManager, QuantizerRole
+from ..quantization import FP8GlobalStateManager, QuantizerRole, get_fp8_te_dtype
 from ..utils import (
     cast_if_needed,
     clear_tensor_data,
@@ -90,6 +91,10 @@ from ..dynamo import (
     TensorOrQuantized,
     register_custom_op,
     is_value_opaque_quantizer,
+)
+from ..dynamo.mxfp8_linear_210 import (
+    is_mxfp8_linear_210_available,
+    mxfp8_linear_210,
 )
 from ..tensor.float8_tensor import Float8CurrentScalingQuantizer, Float8Quantizer
 from ..tensor.mxfp8_tensor import MXFP8Quantizer
@@ -2330,6 +2335,118 @@ class Linear(TransformerEngineBaseModule):
         ):
             get_cublas_workspace(weight.device.index, True, False)
 
+    def _compile_mxfp8_210_unsupported_reason(
+        self,
+        inp: torch.Tensor,
+        is_first_microbatch: Optional[bool],
+        fp8_output: bool,
+        fp8_grad: bool,
+        is_grad_enabled: bool,
+        debug: bool,
+    ) -> Optional[str]:
+        """Return why the fixed-schema PyTorch 2.10 MXFP8 path is unavailable.
+
+        The predicate intentionally describes a small feature set.  In particular
+        it must run before the generic compile path obtains and mutates module
+        quantizers.
+        """
+
+        if not is_mxfp8_linear_210_available():
+            return "the PyTorch 2.10 MXFP8 Linear custom-op backend is unavailable"
+        if not FP8GlobalStateManager.is_fp8_enabled():
+            return "PyTorch 2.10 compiled te.Linear supports only enabled MXFP8BlockScaling"
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+        if not isinstance(recipe, MXFP8BlockScaling):
+            return (
+                "PyTorch 2.10 compiled te.Linear supports only MXFP8BlockScaling "
+                f"(got {type(recipe).__name__})"
+            )
+        if recipe.enable_2d_quantization:
+            return "PyTorch 2.10 MXFP8 Linear backend currently supports only 1D quantization"
+        if recipe.backward_override is not None:
+            return (
+                "PyTorch 2.10 MXFP8 Linear backend requires "
+                "MXFP8BlockScaling.backward_override=None"
+            )
+        if not self.fp8_initialized:
+            return (
+                "PyTorch 2.10 MXFP8 Linear backend requires FP8 metadata to be prewarmed "
+                "by one eager call before torch.compile"
+            )
+        if inp.dtype not in (torch.float16, torch.bfloat16):
+            return "PyTorch 2.10 MXFP8 Linear backend supports only FP16 or BF16 input"
+        if not inp.is_cuda or not inp.is_contiguous():
+            return "PyTorch 2.10 MXFP8 Linear backend requires a contiguous CUDA input"
+        if isinstance(inp, (QuantizedTensor, QuantizedTensorStorage)):
+            return "a quantized input tensor"
+        weight_tensor, bias_tensor = self._get_weight_and_bias_tensors()
+        if isinstance(weight_tensor, (QuantizedTensor, QuantizedTensorStorage)):
+            return "a quantized model weight"
+        if weight_tensor.dtype != inp.dtype:
+            return "matching input and weight FP16/BF16 dtypes"
+        if is_distributed_weight(weight_tensor):
+            return "a DistributedWeight (custom weight parallelism, e.g. GTP)"
+        if self.tp_size != 1 or self.parallel_mode is not None or self.sequence_parallel:
+            return "tensor or sequence parallelism"
+        if self.return_bias or self.gemm_bias_unfused_add:
+            return "return_bias or unfused post-GEMM bias"
+        if self.fsdp_group is not None or self.is_fsdp2:
+            return "FSDP/FSDP2"
+        if any(
+            (
+                self.ub_overlap_ag_fprop,
+                self.ub_overlap_rs_fprop,
+                self.ub_overlap_ag_dgrad,
+                self.ub_overlap_rs_dgrad,
+                self.ub_bulk_dgrad,
+                self.ub_bulk_wgrad,
+            )
+        ):
+            return "Userbuffers communication overlap"
+        if fp8_output or fp8_grad:
+            return "fp8_output=True or fp8_grad=True"
+        if is_first_microbatch is not None:
+            return "FP8 weight caching (is_first_microbatch)"
+        if self.fuse_wgrad_accumulation:
+            return "fuse_wgrad_accumulation (main_grad)"
+        if self.wgrad_store.delay_wgrad_compute():
+            return "delayed wgrad compute (wgrad_store)"
+        if self.save_original_input:
+            return "save_original_input"
+        if is_cpu_offload_enabled():
+            return "CPU activation offloading"
+        if debug:
+            return "debug instrumentation (nvidia-dlfw-inspect)"
+        if is_fp8_activation_recompute_enabled() or in_fp8_activation_recompute_phase():
+            return "FP8 activation recomputation"
+        if FP8GlobalStateManager.fp8_graph_capturing():
+            return "CUDA graph capture"
+        if inp.shape[-1] % 32 != 0 or weight_tensor.shape[-1] % 32 != 0:
+            return "MXFP8 dimensions divisible by 32"
+        if math.prod(inp.shape[:-1]) % 32 != 0 or weight_tensor.shape[0] % 32 != 0:
+            return "MXFP8 leading dimensions divisible by 32"
+        if bias_tensor is not None and bias_tensor.dtype != inp.dtype:
+            return "matching input and bias FP16/BF16 dtypes"
+        del is_grad_enabled
+        return None
+
+    def _forward_mxfp8_210(
+        self,
+        inp: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the fixed-schema PyTorch 2.10 MXFP8 custom op."""
+
+        weight_tensor, bias_tensor = self._get_weight_and_bias_tensors()
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+        assert isinstance(recipe, MXFP8BlockScaling)
+        return mxfp8_linear_210(
+            inp,
+            weight_tensor,
+            bias_tensor if self.apply_bias else None,
+            fwd_fp8_dtype=get_fp8_te_dtype(recipe, fprop_tensor=True),
+            bwd_fp8_dtype=get_fp8_te_dtype(recipe, fprop_tensor=False),
+        )
+
     def forward(
         self,
         inp: torch.Tensor,
@@ -2380,6 +2497,21 @@ class Linear(TransformerEngineBaseModule):
         if self.ub_overlap_rs_dgrad:
             if get_ub_is_fp8(self.ub_name + "_dgrad", FP8GlobalStateManager.is_fp8_enabled()):
                 fp8_grad = True
+
+        # PyTorch 2.10 cannot use the generic #3053 opaque-object custom-op
+        # protocol.  Route its narrow MXFP8 feature set before prepare_forward
+        # and _get_quantizers mutate module-owned quantizer ScriptObjects.
+        if torch.compiler.is_compiling() and is_mxfp8_linear_210_available():
+            compat_reason = self._compile_mxfp8_210_unsupported_reason(
+                inp, is_first_microbatch, fp8_output, fp8_grad, is_grad_enabled, debug
+            )
+            if compat_reason is None:
+                return self._forward_mxfp8_210(inp)
+            warn_compile_eager_fallback(compat_reason)
+            torch._dynamo.graph_break(
+                msg=f"te.Linear falling back to eager: {compat_reason}"
+            )
+            return self._forward_eager_fallback(inp, is_first_microbatch, fp8_output, fp8_grad)
 
         if torch.compiler.is_compiling() and _linear_op is not None:
             reason = self._compile_eager_fallback_reason(
