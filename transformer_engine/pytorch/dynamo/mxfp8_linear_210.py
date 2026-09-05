@@ -18,7 +18,7 @@ only implements single-device, 1D MXFP8 fprop/bprop mechanics.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -34,6 +34,10 @@ _EMPTY_DTYPE = torch.uint8
 _DTYPE_FP16 = 0
 _DTYPE_BF16 = 1
 _TORCH_DTYPE_FROM_CODE = {_DTYPE_FP16: torch.float16, _DTYPE_BF16: torch.bfloat16}
+_registration_attempted = False
+_registration_error: Optional[str] = None
+_mxfp8_linear_fwd_op: Optional[Any] = None
+_mxfp8_linear_bwd_op: Optional[Any] = None
 
 
 def _encode_logical_dtype(dtype: torch.dtype) -> int:
@@ -44,7 +48,7 @@ def _encode_logical_dtype(dtype: torch.dtype) -> int:
     raise ValueError(f"MXFP8 Linear 2.10 backend does not support dtype {dtype}")
 
 
-def is_mxfp8_linear_210_available() -> bool:
+def _can_attempt_registration() -> bool:
     """Whether this fixed-schema backend is applicable to this Torch build.
 
     Do not use presence of ``opaque_object`` as a capability test: PyTorch 2.10
@@ -53,7 +57,7 @@ def is_mxfp8_linear_210_available() -> bool:
     """
 
     version = torch_version()
-    if not ((2, 10, 0) <= version < (2, 11, 0)):
+    if not ((2, 10, 0) <= version < (2, 11, 0)) or not hasattr(torch, "library"):
         return False
     if not hasattr(torch.library, "custom_op"):
         return False
@@ -62,6 +66,49 @@ def is_mxfp8_linear_210_available() -> bool:
     return hasattr(torch.library, "register_fake") and hasattr(
         torch.library, "register_autograd"
     )
+
+
+def _register_ops_if_needed() -> bool:
+    """Register the optional 2.10 ops once, never breaking TE import."""
+
+    global _registration_attempted, _registration_error, _mxfp8_linear_fwd_op, _mxfp8_linear_bwd_op
+    if _registration_attempted:
+        return _mxfp8_linear_fwd_op is not None
+    _registration_attempted = True
+    if not _can_attempt_registration():
+        _registration_error = "required torch.library custom-op APIs are unavailable"
+        return False
+    try:
+        fwd = torch.library.custom_op(
+            f"{_NAMESPACE}::mxfp8_linear_fwd",
+            mutates_args=(),
+            device_types="cuda",
+        )(_mxfp8_linear_fwd_impl)
+        fwd.register_fake(_mxfp8_linear_fwd_fake)
+        bwd = torch.library.custom_op(
+            f"{_NAMESPACE}::mxfp8_linear_bwd",
+            mutates_args=(),
+            device_types="cuda",
+        )(_mxfp8_linear_bwd_impl)
+        bwd.register_fake(_mxfp8_linear_bwd_fake)
+        fwd.register_autograd(
+            _mxfp8_linear_backward_wrapper,
+            setup_context=_mxfp8_linear_setup_context,
+        )
+        _mxfp8_linear_fwd_op = fwd
+        _mxfp8_linear_bwd_op = bwd
+        return True
+    except (AttributeError, ImportError, RuntimeError, TypeError) as exc:
+        _registration_error = f"{type(exc).__name__}: {exc}"
+        _mxfp8_linear_fwd_op = None
+        _mxfp8_linear_bwd_op = None
+        return False
+
+
+def is_mxfp8_linear_210_available() -> bool:
+    """Whether the fixed-schema backend registered successfully."""
+
+    return _register_ops_if_needed()
 
 
 def _empty(device: torch.device) -> torch.Tensor:
@@ -167,12 +214,7 @@ def _out_shape(inp: torch.Tensor, out_features: int) -> Tuple[int, ...]:
     return (*tuple(inp.shape[:-1]), out_features)
 
 
-@torch.library.custom_op(
-    f"{_NAMESPACE}::mxfp8_linear_fwd",
-    mutates_args=(),
-    device_types="cuda",
-)
-def _mxfp8_linear_fwd(
+def _mxfp8_linear_fwd_impl(
     inp: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
@@ -220,7 +262,6 @@ def _mxfp8_linear_fwd(
     return (out, *_storage_buffers(x_q, inp.device), *_storage_buffers(w_q, weight.device))
 
 
-@_mxfp8_linear_fwd.register_fake
 def _mxfp8_linear_fwd_fake(
     inp: torch.Tensor,
     weight: torch.Tensor,
@@ -277,12 +318,7 @@ def _mxfp8_linear_fwd_fake(
     return (out, *_buffers(q_x, inp), *_buffers(q_w, weight))
 
 
-@torch.library.custom_op(
-    f"{_NAMESPACE}::mxfp8_linear_bwd",
-    mutates_args=(),
-    device_types="cuda",
-)
-def _mxfp8_linear_bwd(
+def _mxfp8_linear_bwd_impl(
     grad_output: torch.Tensor,
     x_rowwise_data: torch.Tensor,
     x_rowwise_scale_inv: torch.Tensor,
@@ -357,7 +393,6 @@ def _mxfp8_linear_bwd(
     return dgrad, wgrad, bgrad
 
 
-@_mxfp8_linear_bwd.register_fake
 def _mxfp8_linear_bwd_fake(
     grad_output: torch.Tensor,
     x_rowwise_data: torch.Tensor,
@@ -449,7 +484,8 @@ def _mxfp8_linear_setup_context(ctx, inputs, output) -> None:
 def _mxfp8_linear_backward_wrapper(ctx, grad_output, *unused_output_grads):
     del unused_output_grads
     saved = ctx.saved_tensors
-    dgrad, wgrad, bgrad = _mxfp8_linear_bwd(
+    assert _mxfp8_linear_bwd_op is not None
+    dgrad, wgrad, bgrad = _mxfp8_linear_bwd_op(
         grad_output,
         *saved,
         ctx.fwd_fp8_dtype,
@@ -470,12 +506,6 @@ def _mxfp8_linear_backward_wrapper(ctx, grad_output, *unused_output_grads):
     )
 
 
-_mxfp8_linear_fwd.register_autograd(
-    _mxfp8_linear_backward_wrapper,
-    setup_context=_mxfp8_linear_setup_context,
-)
-
-
 def mxfp8_linear_210(
     inp: torch.Tensor,
     weight: torch.Tensor,
@@ -488,7 +518,12 @@ def mxfp8_linear_210(
 
     needs_dgrad = inp.requires_grad
     needs_wgrad = weight.requires_grad
-    out, *_ = _mxfp8_linear_fwd(
+    if not _register_ops_if_needed() or _mxfp8_linear_fwd_op is None:
+        raise RuntimeError(
+            "PyTorch 2.10 MXFP8 Linear custom-op registration failed: "
+            f"{_registration_error or 'unknown error'}"
+        )
+    out, *_ = _mxfp8_linear_fwd_op(
         inp,
         weight,
         bias,

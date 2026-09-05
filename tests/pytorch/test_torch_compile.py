@@ -44,6 +44,7 @@ from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, Quantizer
 from transformer_engine.pytorch.dynamo import TensorSpec, to_tensor_spec
 from transformer_engine.pytorch.dynamo.mxfp8_linear_210 import is_mxfp8_linear_210_available
+from transformer_engine.pytorch.torch_version import torch_version
 from transformer_engine.pytorch import (
     is_fp8_available,
     is_mxfp8_available,
@@ -1883,6 +1884,16 @@ def test_to_tensor_spec_quantized(factory, shape):
 # ---------------------------------------------------------------------------
 # te.Linear
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    (2, 10, 0) <= torch_version() < (2, 11, 0),
+    reason="The PyTorch 2.10 job must exercise the registered backend instead",
+)
+def test_mxfp8_linear_210_backend_is_import_safe_outside_target_torch():
+    """Importing TE on unsupported Torch versions must not register this op."""
+
+    assert not is_mxfp8_linear_210_available()
 
 
 @pytest.mark.skipif(
